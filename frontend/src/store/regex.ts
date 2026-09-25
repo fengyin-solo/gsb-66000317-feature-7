@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import { ref, computed, watch } from 'vue'
+import type { NFA, MatchResult, MatchStep, MatchSegment, RegexTemplate, ASTNode } from '../types'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
 
@@ -81,67 +81,122 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
     }
   }
 
+  // 解析单个原子（不含量词），返回片段的 [入口, 出口]
+  function parseAtomFragment(): [number, number] {
+    const ch = pattern[pos]
+    let segStart: number, segEnd: number
+    if (ch === '(') {
+      pos++
+      groupCount++
+      if (pattern[pos] === '?') {
+        pos++
+        if (pattern[pos] === ':') { pos++; }
+        const [s, e] = parseOr()
+        segStart = s; segEnd = e
+      } else {
+        const [s, e] = parseOr()
+        segStart = s; segEnd = e
+      }
+      pos++ // skip )
+    } else if (ch === '[') {
+      pos++
+      segStart = newState()
+      segEnd = newState()
+      const matcher = parseCharClass()
+      addTransition(segStart, '__class_' + segStart, segEnd)
+      ;(states[segStart] as any)._matcher = matcher
+    } else if (ch === '.') {
+      segStart = newState()
+      segEnd = newState()
+      addTransition(segStart, '__dot', segEnd)
+      pos++
+    } else if (ch === '\\') {
+      pos++
+      const escaped = pattern[pos]
+      segStart = newState()
+      segEnd = newState()
+      if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
+      else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
+      else if (escaped === 's') addTransition(segStart, '__space', segEnd)
+      else addTransition(segStart, escaped, segEnd)
+      pos++
+    } else if (ch === '^' || ch === '$') {
+      segStart = newState()
+      segEnd = segStart
+      pos++
+    } else {
+      segStart = newState()
+      segEnd = newState()
+      addTransition(segStart, ch, segEnd)
+      pos++
+    }
+    return [segStart, segEnd]
+  }
+
+  const MAX_REPEAT = 100 // {n,m} 展开上限，防止状态爆炸
+
   function parseConcat(): [number, number] {
     let start = newState()
     let end = start
     while (pos < pattern.length && !['|', ')'].includes(pattern[pos])) {
-      let segStart: number, segEnd: number
-      const ch = pattern[pos]
-      if (ch === '(') {
-        pos++
-        groupCount++
-        if (pattern[pos] === '?') {
-          pos++
-          if (pattern[pos] === ':') { pos++; }
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        } else {
-          const [s, e] = parseOr()
-          segStart = s; segEnd = e
-        }
-        pos++ // skip )
-      } else if (ch === '[') {
-        pos++
-        segStart = newState()
-        segEnd = newState()
-        const matcher = parseCharClass()
-        addTransition(segStart, '__class_' + segStart, segEnd)
-        ;(states[segEnd] as any)._matcher = matcher
-      } else if (ch === '.') {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, '__dot', segEnd)
-        pos++
-      } else if (ch === '\\') {
-        pos++
-        const escaped = pattern[pos]
-        segStart = newState()
-        segEnd = newState()
-        if (escaped === 'd') addTransition(segStart, '__digit', segEnd)
-        else if (escaped === 'w') addTransition(segStart, '__word', segEnd)
-        else if (escaped === 's') addTransition(segStart, '__space', segEnd)
-        else addTransition(segStart, escaped, segEnd)
-        pos++
-      } else if (ch === '^' || ch === '$') {
-        segStart = newState()
-        segEnd = segStart
-        pos++
-      } else {
-        segStart = newState()
-        segEnd = newState()
-        addTransition(segStart, ch, segEnd)
-        pos++
-      }
+      const atomStart = pos
+      let [segStart, segEnd] = parseAtomFragment()
 
       // Handle quantifiers
       while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
         const q = pattern[pos]
         if (q === '{') {
-          while (pos < pattern.length && pattern[pos] !== '}') pos++
-          pos++
-        } else {
-          pos++
+          // {n} / {n,} / {n,m}：重放原子源串展开重复，保证后续片段可达
+          const atomEnd = pos
+          let j = pos + 1, buf = ''
+          while (j < pattern.length && pattern[j] !== '}') { buf += pattern[j]; j++ }
+          pos = j + 1
+          const parts = buf.split(',')
+          const min = Math.min(parseInt(parts[0]) || 0, MAX_REPEAT)
+          const max = parts.length === 1 ? min : (parts[1] === '' ? Infinity : Math.min(parseInt(parts[1]) || 0, MAX_REPEAT))
+          const replay = (): [number, number] => {
+            pos = atomStart
+            const frag = parseAtomFragment()
+            pos = atomEnd // 重放后恢复到量词位置
+            return frag
+          }
+          let tail = segEnd
+          // 已构建的片段作为第 1 次出现；min=0 时整体可选
+          if (min === 0) {
+            const qStart = newState(), qEnd = newState()
+            addEpsilon(qStart, segStart); addEpsilon(qStart, qEnd)
+            addEpsilon(segEnd, qEnd)
+            segStart = qStart; tail = qEnd
+          }
+          for (let k = 1; k < min; k++) {
+            const [s, e] = replay()
+            addEpsilon(tail, s)
+            tail = e
+          }
+          if (max === Infinity) {
+            // 无上限：尾部追加 atom* 循环
+            const [s, e] = replay()
+            const qStart = newState(), qEnd = newState()
+            addEpsilon(tail, qStart)
+            addEpsilon(qStart, s); addEpsilon(qStart, qEnd)
+            addEpsilon(e, s); addEpsilon(e, qEnd)
+            tail = qEnd
+          } else {
+            for (let k = Math.max(min, 1); k < max; k++) {
+              const [s, e] = replay()
+              const qStart = newState(), qEnd = newState()
+              addEpsilon(qStart, s); addEpsilon(qStart, qEnd)
+              addEpsilon(e, qEnd)
+              addEpsilon(tail, qStart)
+              tail = qEnd
+            }
+          }
+          segEnd = tail
+          pos = j + 1
+          if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
+          continue
         }
+        pos++
         const qStart = newState()
         const qEnd = newState()
         addEpsilon(qStart, segStart)
@@ -208,6 +263,53 @@ function matchTransition(state: StateNode, symbol: string): number[] {
   return results
 }
 
+// 从 startPos 开始的最长命中结束索引，无命中返回 -1（不记录步骤，供全局扫描复用）
+function longestMatchAt(states: StateNode[], startState: number, input: string, startPos: number): number {
+  let currentStates = Array.from(epsilonClosure(states, startState))
+  let end = -1
+  if (currentStates.some(s => states[s].isAccept)) end = startPos
+  for (let i = startPos; i < input.length; i++) {
+    const next: number[] = []
+    const seen = new Set<number>()
+    for (const s of currentStates) {
+      for (const t of matchTransition(states[s], input[i])) {
+        for (const c of epsilonClosure(states, t)) {
+          if (!seen.has(c)) { seen.add(c); next.push(c) }
+        }
+      }
+    }
+    if (next.length === 0) break
+    currentStates = next
+    if (currentStates.some(s => states[s].isAccept)) end = i + 1
+  }
+  return end
+}
+
+const MAX_MATCHES = 500
+
+// 全局扫描：按非重叠、左起最长规则收集全部命中；零宽命中自动前进一位避免重叠/死循环
+function findAllMatches(states: StateNode[], startState: number, input: string) {
+  const segments: MatchSegment[] = []
+  let zeroWidthCount = 0
+  let truncated = false
+  let pos = 0
+  while (pos <= input.length) {
+    let start = -1, end = -1
+    for (let s = pos; s <= input.length; s++) {
+      const e = longestMatchAt(states, startState, input, s)
+      if (e !== -1) { start = s; end = e; break }
+    }
+    if (start === -1) break
+    const zeroWidth = end === start
+    if (zeroWidth) zeroWidthCount++
+    const text = input.slice(start, end)
+    segments.push({ index: segments.length, start, end, text, groups: [text], zeroWidth })
+    if (segments.length >= MAX_MATCHES) { truncated = true; break }
+    pos = zeroWidth ? end + 1 : end
+  }
+  return { segments, zeroWidthCount, truncated }
+}
+
 function runMatch(states: StateNode[], startState: number, input: string): MatchResult {
   const steps: MatchStep[] = []
   let backtracks = 0
@@ -270,6 +372,7 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
     if (matched || (startPos === input.length && currentStates.some(s => states[s].isAccept))) {
       const matchText = input.substring(startPos, matchEnd)
       const duration = performance.now() - startTime
+      const global = findAllMatches(states, startState, input)
       return {
         matched: true,
         matchText,
@@ -277,13 +380,16 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
         steps,
         backtracks,
         totalSteps: stepIndex,
-        duration: Math.round(duration * 100) / 100
+        duration: Math.round(duration * 100) / 100,
+        matches: global.segments,
+        zeroWidthCount: global.zeroWidthCount,
+        matchesTruncated: global.truncated
       }
     }
   }
 
   const duration = performance.now() - startTime
-  return { matched: false, matchText: '', groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100 }
+  return { matched: false, matchText: '', groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100, matches: [], zeroWidthCount: 0, matchesTruncated: false }
 }
 
 export function computeNFA(nfaResult: ReturnType<typeof buildNFA>): NFA {
@@ -404,17 +510,28 @@ export const useRegexStore = defineStore('regex', () => {
 
   const groupColors = GROUP_COLORS
 
-  const matchHighlight = computed(() => {
-    if (!matchResult.value || !matchResult.value.matched) return null
-    const matchText = matchResult.value.matchText
-    const idx = testString.value.indexOf(matchText)
-    if (idx === -1) return null
-    return {
-      before: testString.value.substring(0, idx),
-      match: matchText,
-      after: testString.value.substring(idx + matchText.length)
+  // 多段匹配浏览：命中列表、当前选中片段及其导航
+  const currentMatchIndex = ref(0)
+  const matches = computed(() => matchResult.value?.matches ?? [])
+  const currentMatch = computed(() => matches.value[currentMatchIndex.value] ?? null)
+  const zeroWidthCount = computed(() => matchResult.value?.zeroWidthCount ?? 0)
+  const matchesTruncated = computed(() => matchResult.value?.matchesTruncated ?? false)
+
+  // 重新执行/输入变化导致命中列表更新时，钳制选中索引，避免片段错位
+  watch(matches, ms => {
+    if (currentMatchIndex.value > ms.length - 1) {
+      currentMatchIndex.value = Math.max(0, ms.length - 1)
     }
   })
+
+  function selectMatch(i: number) {
+    const len = matches.value.length
+    if (len === 0) { currentMatchIndex.value = 0; return }
+    currentMatchIndex.value = Math.min(Math.max(i, 0), len - 1)
+  }
+
+  function nextMatch() { selectMatch(currentMatchIndex.value + 1) }
+  function prevMatch() { selectMatch(currentMatchIndex.value - 1) }
 
   function execute() {
     error.value = ''
@@ -424,6 +541,7 @@ export const useRegexStore = defineStore('regex', () => {
       matchResult.value = runMatch(built.states, built.startState, testString.value)
       ast.value = parseAST(pattern.value)
       currentStep.value = 0
+      currentMatchIndex.value = 0
     } catch (e: any) {
       error.value = e.message || '正则表达式解析错误'
       nfa.value = null
@@ -481,8 +599,10 @@ export const useRegexStore = defineStore('regex', () => {
 
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
-    selectedTemplate, groupColors, matchHighlight,
+    selectedTemplate, groupColors,
+    matches, currentMatch, currentMatchIndex, zeroWidthCount, matchesTruncated,
     execute, setPattern, setTestString, applyTemplate,
+    selectMatch, nextMatch, prevMatch,
     stepForward, stepBackward, resetStep, play, stop
   }
 })

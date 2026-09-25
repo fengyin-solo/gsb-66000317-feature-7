@@ -2,7 +2,7 @@
   <div class="min-h-screen bg-slate-900 text-slate-200">
     <header class="border-b border-slate-700 px-6 py-4">
       <h1 class="text-2xl font-bold text-cyan-400">正则表达式可视化调试器</h1>
-      <p class="text-sm text-slate-500 mt-1">NFA 状态机可视化 · 逐步匹配高亮 · 分组捕获 · 回溯追踪</p>
+      <p class="text-sm text-slate-500 mt-1">NFA 状态机可视化 · 逐步匹配高亮 · 多段结果浏览 · 分组捕获 · 回溯追踪</p>
     </header>
 
     <div class="flex flex-col lg:flex-row gap-4 p-4">
@@ -20,8 +20,9 @@
         <div class="bg-slate-800 rounded-lg p-4 border border-slate-700">
           <h3 class="text-sm font-bold text-slate-400 mb-3">匹配统计</h3>
           <div v-if="store.matchResult" class="space-y-2 text-sm">
-            <div class="flex justify-between"><span class="text-slate-500">匹配状态</span><span :class="store.matchResult.matched ? 'text-green-400' : 'text-red-400'">{{ store.matchResult.matched ? '✓ 匹配成功' : '✗ 未匹配' }}</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">匹配文本</span><span class="text-cyan-400 font-mono truncate ml-2">{{ store.matchResult.matchText || '—' }}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">匹配状态</span><span :class="store.matchResult.matched ? 'text-green-400' : 'text-red-400'">{{ store.matchResult.matched ? `✓ ${store.matches.length} 处命中` : '✗ 未匹配' }}</span></div>
+            <div v-if="store.matchResult.matched" class="flex justify-between"><span class="text-slate-500">当前片段</span><span class="text-cyan-400 font-mono">#{{ store.currentMatchIndex + 1 }} / {{ store.matches.length }}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">匹配文本</span><span class="text-cyan-400 font-mono truncate ml-2">{{ store.currentMatch ? (store.currentMatch.text || '∅') : '—' }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">总步数</span><span class="text-slate-300">{{ store.matchResult.totalSteps }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">回溯次数</span><span :class="store.matchResult.backtracks > 0 ? 'text-orange-400 font-bold' : 'text-slate-300'">{{ store.matchResult.backtracks }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">耗时(ms)</span><span class="text-slate-300">{{ store.matchResult.duration }}</span></div>

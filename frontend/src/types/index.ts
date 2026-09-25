@@ -31,6 +31,15 @@ export interface MatchStep {
   isMatch: boolean
 }
 
+export interface MatchSegment {
+  index: number      // 命中序号（从 0 开始）
+  start: number      // 在原文中的起始索引（含）
+  end: number        // 在原文中的结束索引（不含）
+  text: string       // 命中文本
+  groups: string[]   // 分组捕获（group 0 = 整体命中）
+  zeroWidth: boolean // 是否零宽命中
+}
+
 export interface MatchResult {
   matched: boolean
   matchText: string
@@ -39,6 +48,9 @@ export interface MatchResult {
   backtracks: number
   totalSteps: number
   duration: number
+  matches: MatchSegment[]   // 全部命中（非重叠、左起最长）
+  zeroWidthCount: number    // 零宽命中数量
+  matchesTruncated: boolean // 命中过多被截断
 }
 
 export interface RegexTemplate {
