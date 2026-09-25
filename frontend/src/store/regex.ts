@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchResult, MatchStep, MatchSegment, RegexTemplate, ASTNode } from '../types'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
+const MAX_MATCHES = 200      // 命中片段上限,超出则截断并标记
+const MAX_STEPS = 20000      // 步骤记录上限,防止长文本下卡顿
+const LONG_TEXT_THRESHOLD = 2000 // 超过该长度视为长文本,仅提示不修改输入
 
 export const TEMPLATES: RegexTemplate[] = [
   { name: '邮箱地址', pattern: '^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$', description: '匹配标准邮箱格式：用户名@域名.顶级域', testString: 'user@example.com admin@mail.org test.user+tag@sub.domain.co.uk', category: '常用' },
@@ -58,6 +61,28 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
     states[from].epsilonTransitions.push(to)
   }
 
+  // 克隆 [segStart, segEnd] 区间内的状态与内部转移,用于 {n,m} 量词展开
+  function cloneSegment(segStart: number, segEnd: number): [number, number] {
+    const idMap = new Map<number, number>()
+    for (let i = segStart; i <= segEnd; i++) idMap.set(i, newState())
+    for (let i = segStart; i <= segEnd; i++) {
+      const src = states[i]
+      const dst = idMap.get(i)!
+      src.transitions.forEach((targets, sym) => {
+        for (const t of targets) {
+          const nt = idMap.get(t)
+          if (nt !== undefined) addTransition(dst, sym, nt)
+        }
+      })
+      for (const t of src.epsilonTransitions) {
+        const nt = idMap.get(t)
+        if (nt !== undefined) addEpsilon(dst, nt)
+      }
+      if ((src as any)._matcher) (states[dst] as any)._matcher = (src as any)._matcher
+    }
+    return [idMap.get(segStart)!, idMap.get(segEnd)!]
+  }
+
   function parseCharClass(): (ch: string) => boolean {
     const negative = pattern[pos] === '^'
     if (negative) pos++
@@ -106,7 +131,7 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
         segEnd = newState()
         const matcher = parseCharClass()
         addTransition(segStart, '__class_' + segStart, segEnd)
-        ;(states[segEnd] as any)._matcher = matcher
+        ;(states[segStart] as any)._matcher = matcher
       } else if (ch === '.') {
         segStart = newState()
         segEnd = newState()
@@ -137,11 +162,57 @@ function buildNFA(pattern: string): { states: StateNode[]; startState: number; a
       while (pos < pattern.length && ['*', '+', '?', '{'].includes(pattern[pos])) {
         const q = pattern[pos]
         if (q === '{') {
-          while (pos < pattern.length && pattern[pos] !== '}') pos++
+          // 解析 {n} {n,} {n,m},通过克隆片段展开重复
+          let spec = ''
           pos++
-        } else {
+          while (pos < pattern.length && pattern[pos] !== '}') spec += pattern[pos++]
           pos++
+          const mm = spec.match(/^(\d+)(?:,(\d*))?$/)
+          if (mm) {
+            const min = parseInt(mm[1], 10)
+            const max = mm[2] === undefined ? min : (mm[2] === '' ? Infinity : parseInt(mm[2], 10))
+            const baseStart = segStart, baseEnd = segEnd
+            if (max === 0) {
+              // {0}:匹配空串
+              segStart = newState(); segEnd = segStart
+            } else {
+              if (min === 0) {
+                // 原片段整体可选
+                const optStart = newState(), optEnd = newState()
+                addEpsilon(optStart, segStart); addEpsilon(optStart, optEnd)
+                addEpsilon(segEnd, optEnd)
+                segStart = optStart; segEnd = optEnd
+              }
+              // 必需的后续副本(原片段计为第1份)
+              for (let k = Math.max(min, 1); k > 1; k--) {
+                const [cs, ce] = cloneSegment(baseStart, baseEnd)
+                addEpsilon(segEnd, cs)
+                segEnd = ce
+              }
+              if (max === Infinity) {
+                // 尾部任意次重复:克隆一份并成环
+                const [cs, ce] = cloneSegment(baseStart, baseEnd)
+                const loopEnd = newState()
+                addEpsilon(segEnd, cs); addEpsilon(segEnd, loopEnd)
+                addEpsilon(ce, cs); addEpsilon(ce, loopEnd)
+                segEnd = loopEnd
+              } else {
+                // 可选副本:每份均可跳过
+                const optEnd = newState()
+                for (let k = Math.max(min, 1); k < max; k++) {
+                  const [cs, ce] = cloneSegment(baseStart, baseEnd)
+                  addEpsilon(segEnd, cs); addEpsilon(segEnd, optEnd)
+                  segEnd = ce
+                }
+                addEpsilon(segEnd, optEnd)
+                segEnd = optEnd
+              }
+            }
+          }
+          if (pos < pattern.length && pattern[pos] === '?') pos++ // lazy
+          continue
         }
+        pos++
         const qStart = newState()
         const qEnd = newState()
         addEpsilon(qStart, segStart)
@@ -210,14 +281,16 @@ function matchTransition(state: StateNode, symbol: string): number[] {
 
 function runMatch(states: StateNode[], startState: number, input: string): MatchResult {
   const steps: MatchStep[] = []
+  const matches: MatchSegment[] = []
   let backtracks = 0
   let stepIndex = 0
+  let truncated = false
   const startTime = performance.now()
 
-  // Try to match from each position
-  for (let startPos = 0; startPos <= input.length; startPos++) {
+  // 从 startPos 开始寻找最左最长命中,返回命中结束位置;未命中返回 -1
+  function matchFrom(startPos: number): number {
     let currentStates = Array.from(epsilonClosure(states, startState))
-    let matched = false
+    let matched = currentStates.some(s => states[s].isAccept)
     let matchEnd = startPos
 
     for (let i = startPos; i < input.length; i++) {
@@ -233,57 +306,92 @@ function runMatch(states: StateNode[], startState: number, input: string): Match
             if (!seen.has(c)) {
               seen.add(c)
               nextStates.push(c)
-              steps.push({
-                stepIndex: stepIndex++,
-                charIndex: i,
-                char,
-                currentState: s,
-                nextState: c,
-                transition: char,
-                isBacktrack: false,
-                isMatch: true
-              })
+              if (stepIndex < MAX_STEPS) {
+                steps.push({
+                  stepIndex: stepIndex,
+                  charIndex: i,
+                  char,
+                  currentState: s,
+                  nextState: c,
+                  transition: char,
+                  isBacktrack: false,
+                  isMatch: true
+                })
+              }
+              stepIndex++
             }
           }
         }
       }
 
       if (nextStates.length === 0) {
-        if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i; break }
-        backtracks++
-        steps.push({
-          stepIndex: stepIndex++,
-          charIndex: i,
-          char,
-          currentState: currentStates[0] || -1,
-          nextState: -1,
-          transition: 'FAIL',
-          isBacktrack: true,
-          isMatch: false
-        })
+        if (!matched) {
+          backtracks++
+          if (stepIndex < MAX_STEPS) {
+            steps.push({
+              stepIndex: stepIndex,
+              charIndex: i,
+              char,
+              currentState: currentStates[0] || -1,
+              nextState: -1,
+              transition: 'FAIL',
+              isBacktrack: true,
+              isMatch: false
+            })
+          }
+          stepIndex++
+        }
         break
       }
       currentStates = nextStates
       if (currentStates.some(s => states[s].isAccept)) { matched = true; matchEnd = i + 1 }
     }
 
-    if (matched || (startPos === input.length && currentStates.some(s => states[s].isAccept))) {
-      const matchText = input.substring(startPos, matchEnd)
-      const duration = performance.now() - startTime
-      return {
-        matched: true,
-        matchText,
-        groups: [matchText],
-        steps,
-        backtracks,
-        totalSteps: stepIndex,
-        duration: Math.round(duration * 100) / 100
-      }
-    }
+    return matched ? matchEnd : -1
   }
 
+  // 全局扫描:逐段收集所有命中(非重叠),空命中前进一位避免死循环
+  let searchPos = 0
+  while (searchPos <= input.length) {
+    if (matches.length >= MAX_MATCHES) { truncated = true; break }
+    let foundStart = -1
+    let foundEnd = -1
+    for (let startPos = searchPos; startPos <= input.length; startPos++) {
+      const end = matchFrom(startPos)
+      if (end !== -1) { foundStart = startPos; foundEnd = end; break }
+    }
+    if (foundStart === -1) break
+
+    const text = input.substring(foundStart, foundEnd)
+    const prev = matches[matches.length - 1]
+    matches.push({
+      index: matches.length,
+      start: foundStart,
+      end: foundEnd,
+      text,
+      groups: [text],
+      isEmpty: foundEnd === foundStart,
+      overlapped: prev ? foundStart < prev.end : false
+    })
+    // 空命中前进一位,否则从下一段继续;保证片段不错位、不重叠
+    searchPos = foundEnd > foundStart ? foundEnd : foundEnd + 1
+  }
+
+  if (stepIndex >= MAX_STEPS) truncated = true
+
   const duration = performance.now() - startTime
-  return { matched: false, matchText: '', groups: [], steps, backtracks, totalSteps: stepIndex, duration: Math.round(duration * 100) / 100 }
+  const first = matches[0]
+  return {
+    matched: matches.length > 0,
+    matchText: first ? first.text : '',
+    groups: first ? first.groups : [],
+    matches,
+    truncated,
+    steps,
+    backtracks,
+    totalSteps: stepIndex,
+    duration: Math.round(duration * 100) / 100
+  }
 }
 
 export function computeNFA(nfaResult: ReturnType<typeof buildNFA>): NFA {
@@ -395,6 +503,7 @@ export const useRegexStore = defineStore('regex', () => {
   const pattern = ref('^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$')
   const testString = ref('user@example.com admin@mail.org invalid-email')
   const currentStep = ref(0)
+  const currentMatchIndex = ref(0)
   const isPlaying = ref(false)
   const nfa = ref<NFA | null>(null)
   const matchResult = ref<MatchResult | null>(null)
@@ -404,16 +513,45 @@ export const useRegexStore = defineStore('regex', () => {
 
   const groupColors = GROUP_COLORS
 
+  const matches = computed<MatchSegment[]>(() => matchResult.value?.matches ?? [])
+
+  const currentMatch = computed<MatchSegment | null>(() => {
+    const list = matches.value
+    if (list.length === 0) return null
+    // 索引 clamp,保证重新执行/切换后选中片段不错位
+    const i = Math.min(Math.max(currentMatchIndex.value, 0), list.length - 1)
+    return list[i]
+  })
+
+  const isLongText = computed(() => testString.value.length > LONG_TEXT_THRESHOLD)
+
+  const hasOverlap = computed(() => matches.value.some(m => m.overlapped))
+
+  // 基于当前选中片段的索引位置切分文本,不用 indexOf,避免相同文本多段命中时错位
   const matchHighlight = computed(() => {
-    if (!matchResult.value || !matchResult.value.matched) return null
-    const matchText = matchResult.value.matchText
-    const idx = testString.value.indexOf(matchText)
-    if (idx === -1) return null
+    const seg = currentMatch.value
+    if (!seg) return null
     return {
-      before: testString.value.substring(0, idx),
-      match: matchText,
-      after: testString.value.substring(idx + matchText.length)
+      before: testString.value.substring(0, seg.start),
+      match: testString.value.substring(seg.start, seg.end),
+      after: testString.value.substring(seg.end)
     }
+  })
+
+  // 将整段文本按所有命中切分为有序片段,用于整文高亮渲染
+  const highlightSegments = computed(() => {
+    const text = testString.value
+    const list = matches.value
+    if (list.length === 0) return [{ text, isMatch: false, matchIndex: -1 }]
+    const parts: { text: string; isMatch: boolean; matchIndex: number }[] = []
+    let cursor = 0
+    for (const m of list) {
+      if (m.start > cursor) parts.push({ text: text.substring(cursor, m.start), isMatch: false, matchIndex: -1 })
+      parts.push({ text: text.substring(m.start, m.end), isMatch: true, matchIndex: m.index })
+      cursor = Math.max(cursor, m.end)
+    }
+    if (cursor < text.length) parts.push({ text: text.substring(cursor), isMatch: false, matchIndex: -1 })
+    return parts
   })
 
   function execute() {
@@ -424,11 +562,13 @@ export const useRegexStore = defineStore('regex', () => {
       matchResult.value = runMatch(built.states, built.startState, testString.value)
       ast.value = parseAST(pattern.value)
       currentStep.value = 0
+      currentMatchIndex.value = 0 // 重新执行后回到第一段,避免越界错位
     } catch (e: any) {
       error.value = e.message || '正则表达式解析错误'
       nfa.value = null
       matchResult.value = null
       ast.value = null
+      currentMatchIndex.value = 0
     }
   }
 
@@ -463,6 +603,21 @@ export const useRegexStore = defineStore('regex', () => {
     currentStep.value = 0
   }
 
+  // 多段命中导航:越界时 clamp,保证选中片段始终有效
+  function selectMatch(i: number) {
+    const len = matches.value.length
+    if (len === 0) { currentMatchIndex.value = 0; return }
+    currentMatchIndex.value = Math.min(Math.max(i, 0), len - 1)
+  }
+
+  function nextMatch() {
+    selectMatch(currentMatchIndex.value + 1)
+  }
+
+  function prevMatch() {
+    selectMatch(currentMatchIndex.value - 1)
+  }
+
   function play() {
     isPlaying.value = true
     const interval = setInterval(() => {
@@ -480,9 +635,10 @@ export const useRegexStore = defineStore('regex', () => {
   }
 
   return {
-    pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
-    selectedTemplate, groupColors, matchHighlight,
+    pattern, testString, currentStep, currentMatchIndex, isPlaying, nfa, matchResult, ast, error,
+    selectedTemplate, groupColors, matches, currentMatch, isLongText, hasOverlap,
+    matchHighlight, highlightSegments,
     execute, setPattern, setTestString, applyTemplate,
-    stepForward, stepBackward, resetStep, play, stop
+    stepForward, stepBackward, resetStep, selectMatch, nextMatch, prevMatch, play, stop
   }
 })

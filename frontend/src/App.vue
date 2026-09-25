@@ -14,6 +14,7 @@
       <div class="lg:w-1/2 space-y-4">
         <NfaVisualizer />
         <MatchHighlight />
+        <MatchBoard />
       </div>
 
       <div class="lg:w-1/4 space-y-4">
@@ -21,7 +22,9 @@
           <h3 class="text-sm font-bold text-slate-400 mb-3">匹配统计</h3>
           <div v-if="store.matchResult" class="space-y-2 text-sm">
             <div class="flex justify-between"><span class="text-slate-500">匹配状态</span><span :class="store.matchResult.matched ? 'text-green-400' : 'text-red-400'">{{ store.matchResult.matched ? '✓ 匹配成功' : '✗ 未匹配' }}</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">匹配文本</span><span class="text-cyan-400 font-mono truncate ml-2">{{ store.matchResult.matchText || '—' }}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">命中段数</span><span class="text-cyan-400">{{ store.matches.length }}{{ store.matchResult.truncated ? ' (已截断)' : '' }}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">当前片段</span><span class="text-cyan-400 font-mono truncate ml-2">{{ store.currentMatch ? `#${store.currentMatch.index + 1} [${store.currentMatch.start}, ${store.currentMatch.end})` : '—' }}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">匹配文本</span><span class="text-cyan-400 font-mono truncate ml-2">{{ store.currentMatch?.text || '—' }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">总步数</span><span class="text-slate-300">{{ store.matchResult.totalSteps }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">回溯次数</span><span :class="store.matchResult.backtracks > 0 ? 'text-orange-400 font-bold' : 'text-slate-300'">{{ store.matchResult.backtracks }}</span></div>
             <div class="flex justify-between"><span class="text-slate-500">耗时(ms)</span><span class="text-slate-300">{{ store.matchResult.duration }}</span></div>
@@ -63,6 +66,7 @@ import { useRegexStore } from './store/regex'
 import RegexEditor from './components/RegexEditor.vue'
 import NfaVisualizer from './components/NfaVisualizer.vue'
 import MatchHighlight from './components/MatchHighlight.vue'
+import MatchBoard from './components/MatchBoard.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
 
 const store = useRegexStore()
